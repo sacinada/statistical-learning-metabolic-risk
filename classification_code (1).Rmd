@@ -1,0 +1,312 @@
+---
+title: "Final project report: Analysis of Metabolic Risk Factors "
+author: "Saci Nada"
+date: "18/03/2026"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries, include=FALSE}
+library(haven)
+library(dplyr)
+library(performance)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(plotROC)
+library(pROC)
+library(corrplot)
+library(leaps)
+library(factoextra)
+library(tsne)
+library(umap)
+```
+
+## Introduction
+
+This study uses the NHANES 2013–2014 dataset (n = 2118), which contains demographic, physical and blood marker measurements for a sample of the US population. The variables available are: age, sex, physical activity, BMI, fasting glucose, diabetes diagnosis, 2h glucose (OGTT), insulin, waist circumference, HDL cholesterol, systolic and diastolic blood pressure.
+
+The study has two complementary objectives. The first is the prediction of insulin levels (LBXIN) from all available variables, treated as a regression problem. The second is the classification of patients as having high abdominal obesity risk (waist ≥ 94 cm) using only blood markers and demographic variables, with insulin kept as a continuous predictor. Together, these two parts form a coherent bilateral analysis of the relationship between insulin and abdominal adiposity: the regression predicts insulin from metabolic markers, while the classification predicts abdominal obesity risk from those same markers, insulin included.
+
+BMI is removed from the classification analysis because it is directly correlated with waist circumference (r = 0.92) and would give the model the answer without learning anything meaningful.
+
+---
+
+
+# Part 1 — Classification
+
+## Data Preparation
+
+```{r data-prep-classif}
+dataset = read.csv("my_data_clean.csv")
+
+dataset$AbdominalObesity = ifelse(dataset$BMXWAIST >= 94, "High", "Normal")
+dataset$AbdominalObesity = factor(dataset$AbdominalObesity)
+
+table(dataset$AbdominalObesity)
+
+dataset$SEQN      = NULL
+dataset$BMXWAIST  = NULL
+dataset$BMXBMI    = NULL
+dataset$age_group = NULL
+```
+
+A binary target variable is created using the WHO threshold of 94 cm for waist circumference. BMI is removed because it is directly correlated with waist (r = 0.92) and would give the model the answer without learning anything meaningful. The classes are well balanced, with approximately 49% High and 51% Normal, so no correction for imbalance is needed.
+
+## PCA
+
+```{r pca,}
+data_array = dataset[, !names(dataset) %in% "AbdominalObesity"]
+
+myPCA = prcomp(data_array, scale. = TRUE)
+
+summary(myPCA)
+screeplot(myPCA, type = "l", npcs = 5)
+myPCA$rotation
+```
+
+```{r pca-plot}
+biplot(myPCA, scale = 0, xlabs = rep(".", nrow(data_array)))
+
+fviz_pca(myPCA, geom.ind = "point", pointshape = 21,
+         pointsize = 2,
+         fill.ind  = dataset$AbdominalObesity,
+         col.ind   = "black",
+         palette   = "jco",
+         addEllipses = TRUE,
+         label     = "var",
+         col.var   = "black",
+         repel     = TRUE,
+         legend.title = "Abdominal obesity") +
+  ggtitle("PCA — colored by abdominal obesity (waist >= 94 cm)") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+PC1 and PC2 together explain only 38.6% of the variance, and the two classes overlap substantially on the PCA plot. This means there is no simple linear separation between High and Normal patients, which already suggests that non-linear classifiers will be needed.
+
+## t-SNE
+
+```{r tsne}
+my_table = data.frame(
+  AbdominalObesity = dataset$AbdominalObesity,
+  scale(dataset[, !names(dataset) %in% "AbdominalObesity"])
+)
+
+ecb = function(x) {
+  epoc_df = data.frame(x, my_groups = my_table$AbdominalObesity)
+  plt = ggplot(epoc_df, aes(x = X1, y = X2,
+                             label = my_groups,
+                             color = my_groups)) +
+    geom_point()
+  print(plt)
+}
+
+set.seed(189)
+tsne_groups = tsne(my_table[, 2:ncol(my_table)],
+                   epoch          = 100,
+                   epoch_callback = ecb,
+                   perplexity     = 20,
+                   max_iter       = 1000)
+```
+
+```{r tsne-plot}
+t_SNE_graph = data.frame(x     = tsne_groups[, 1],
+                          y     = tsne_groups[, 2],
+                          group = my_table[, 1])
+
+ggplot(t_SNE_graph, aes(x = x, y = y, color = group)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("High" = "#E07B39", "Normal" = "#3A86C8")) +
+  labs(title = "t-SNE — colored by abdominal obesity",
+       color = "Abdominal obesity",
+       x = "t-SNE 1", y = "t-SNE 2") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## UMAP
+
+```{r umap}
+groups_umap = umap(my_table[, 2:ncol(my_table)],
+                   n_neighbors   = 30,
+                   learning_rate = 0.5,
+                   init          = "normlaplacian",
+                   n_epochs      = 200)
+
+umap_graph = data.frame(x     = groups_umap$layout[, 1],
+                         y     = groups_umap$layout[, 2],
+                         color = my_table[, 1])
+
+ggplot(umap_graph, aes(x = x, y = y, color = color)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("High" = "#E07B39", "Normal" = "#3A86C8")) +
+  labs(title = "UMAP — colored by abdominal obesity",
+       color = "Abdominal obesity",
+       x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Both t-SNE and UMAP show only a partial separation between the two classes. The High and Normal patients form overlapping clouds rather than distinct clusters, which confirms the PCA result: the metabolic signal exists but is not strong enough to perfectly separate the groups. This justifies the use of non-linear classifiers.
+
+## Train / Test Split
+
+```{r split-classif}
+set.seed(189)
+
+sample = sample(c(TRUE, FALSE), nrow(dataset), replace = TRUE, prob = c(0.7, 0.3))
+train  = dataset[sample, ]
+test   = dataset[!sample, ]
+```
+
+## Random Forest
+
+```{r rf-initial}
+forest = randomForest(AbdominalObesity ~ ., data = train,
+                      classwt = c("Normal" = 1, "High" = 1.5))
+plot(forest)
+```
+
+A class weight of 1.5 is applied to the High class to account for the clinical cost of missing a high-risk patient. The error curve stabilizes well before 500 trees, confirming that the default number of trees is sufficient.
+
+```{r rf-mtry}
+nb_vars          = 1:(ncol(dataset) - 1)
+num_tree         = 100
+Error_OOB_nbvars = c()
+
+for (i in nb_vars) {
+  print(paste(i, "variable(s) tested"))
+  forest = randomForest(AbdominalObesity ~ ., data = train,
+                        mtry = i, ntree = num_tree)
+  Error_OOB_nbvars[i] = forest$err.rate[num_tree, "OOB"]
+}
+
+plot(nb_vars, Error_OOB_nbvars)
+```
+
+The OOB error is minimal at mtry = 2, meaning that testing 2 variables at each split gives the best performance.
+
+```{r rf-optimal}
+optimal_forest = randomForest(AbdominalObesity ~ ., data = train,
+                              mtry       = 2,
+                              ntree      = 200,
+                              importance = TRUE,
+                              classwt    = c("Normal" = 1, "High" = 1.5))
+
+importancedf = data.frame(optimal_forest$importance)
+
+varImpPlot(optimal_forest, type = 1, scale = FALSE,
+           n.var = ncol(dataset) - 1, cex = 0.8,
+           main = "Importance of variables")
+```
+
+Insulin (LBXIN), age (RIDAGEYR) and HDL cholesterol (LBDHDD) are the three most important variables. This is consistent with what is known about metabolic syndrome: central adiposity is closely linked to insulin resistance and dyslipidemia.
+
+```{r rf-predict}
+prediction = predict(optimal_forest, newdata = test)
+
+sum(prediction == test$AbdominalObesity) / length(prediction)
+
+annotation       = test$AbdominalObesity
+annotation_high  = annotation[annotation == "High"]
+prediction_high  = prediction[annotation == "High"]
+sum(annotation_high == prediction_high) / length(annotation_high)
+
+annotation_normal    = annotation[annotation == "Normal"]
+prediction_normal    = prediction[annotation == "Normal"]
+sum(annotation_normal == prediction_normal) / length(annotation_normal)
+```
+
+The Random Forest achieves a good overall accuracy. Sensitivity is slightly lower than specificity, which reflects the difficulty of detecting high-risk patients from blood markers alone, without any physical measurement.
+
+## Classification Tree
+
+```{r tree-max}
+mydataframe = train
+
+max_tree = rpart(AbdominalObesity ~ ., data = mydataframe,
+                 method = "class", cp = 0)
+plotcp(max_tree)
+printcp(max_tree)
+```
+
+A maximal tree is built first to explore all possible splits. The cp plot is used to identify where the cross-validated error stabilizes, in order to select the optimal pruning threshold.
+
+```{r tree-pruned}
+cpOpt       = max_tree$cptable[which.min(max_tree$cptable[, 4]), 1]
+pruned_tree = rpart(AbdominalObesity ~ ., data = mydataframe,
+                    method = "class", cp = cpOpt)
+rpart.plot(pruned_tree, cex = 0.5)
+```
+
+The pruned tree is more interpretable than the Random Forest. The first split is made on insulin (LBXIN), confirming its dominant role in predicting abdominal obesity risk.
+
+```{r tree-predict}
+y_test = predict(pruned_tree, newdata = test, type = "class")
+
+sum(y_test == test$AbdominalObesity) / length(y_test)
+
+annotation       = test$AbdominalObesity
+annotation_high  = annotation[annotation == "High"]
+prediction_high  = y_test[annotation == "High"]
+sum(annotation_high == prediction_high) / length(annotation_high)
+
+annotation_normal = annotation[annotation == "Normal"]
+prediction_normal = y_test[annotation == "Normal"]
+sum(annotation_normal == prediction_normal) / length(annotation_normal)
+```
+
+The classification tree performs slightly worse than the Random Forest, which is expected given that a single tree has higher variance. However it remains interpretable and gives comparable results.
+
+```{r tree-importance}
+x = pruned_tree$variable.importance
+df_importance = data.frame(Variable   = factor(names(x), levels = names(x)),
+                            Importance = as.numeric(x))
+
+ggplot(df_importance, aes(x = Importance, y = Variable)) +
+  geom_col(fill = "skyblue") +
+  labs(x = "Variable importance", size = 0.1) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+All variables contribute to the model. Insulin, age and HDL are again the top predictors, consistent with the Random Forest results.
+
+## ROC Curve Comparison
+
+```{r roc}
+forest_prediction = predict(optimal_forest, newdata = test, type = "prob")
+tree_prediction   = predict(pruned_tree,    newdata = test, type = "prob")
+
+vector_with_truth = as.numeric(test$AbdominalObesity == "High")
+
+forest_probs = forest_prediction[, "High"]
+tree_probs   = tree_prediction[, "High"]
+
+roc_df_forest = data.frame(truth      = vector_with_truth,
+                            prediction = forest_probs,
+                            method     = "Random Forest")
+roc_df_tree   = data.frame(truth      = vector_with_truth,
+                            prediction = tree_probs,
+                            method     = "Classification Tree")
+roc_df_all = rbind(roc_df_forest, roc_df_tree)
+
+ggplot(roc_df_all, aes(d = truth, m = prediction, color = method)) +
+  geom_roc(labelsize = 3) +
+  style_roc(xlab = "False Positive Fraction",
+            ylab = "True Positive Fraction") +
+  geom_abline(slope = 1, intercept = 0)
+
+pROC::roc(roc_df_forest$truth, roc_df_forest$prediction)
+pROC::roc(roc_df_tree$truth,   roc_df_tree$prediction)
+```
+
+The Random Forest (AUC ≈ 0.85) outperforms the Classification Tree. The ROC curves confirm that both models perform well above chance, with the Random Forest showing a better trade-off between sensitivity and specificity across all thresholds. The most important predictors in both models are insulin, age and HDL cholesterol — consistent with the regression results, where these same variables emerged as the strongest predictors of insulin levels. Together, the two parts of this study confirm that the relationship between insulin and abdominal adiposity is bidirectional and robust across different modelling approaches.

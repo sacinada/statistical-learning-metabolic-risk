@@ -1,0 +1,302 @@
+---
+title: "Analysis of Metabolic Risk Factors "
+author: ""
+date: ""
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries, include=FALSE}
+library(haven)
+library(dplyr)
+library(performance) 
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(plotROC)
+library(pROC)
+library(corrplot)
+library(leaps)
+```
+
+## Dataset Construction
+The data used in this study were obtained from the NHANES 2013–2014 database.
+Three datasets were merged using the unique identifier SEQN: Age Prediction Subset, Body Measures, and Blood Pressure. From the latter, only the systolic blood pressure (BPXSY1) and diastolic blood pressure (BPXDI1) variables were retained.
+```{r}
+nhanes_subset <- read.csv(file.choose(), header = TRUE)
+body_measures <- read_xpt(file.choose())
+blood_pressure <- read_xpt(file.choose())
+blood_pressure <- blood_pressure %>%
+  select(SEQN, BPXSY1, BPXDI1)
+combined_data1 <- full_join(nhanes_subset, body_measures, by = "SEQN")
+combined_data1 <- full_join(combined_data1, blood_pressure, by = "SEQN")
+```
+
+The final dataset contains 13 demographic, biological, and clinical variables from 2118 individuals.
+
+This study has two distinct objectives:
+The first is the prediction of insulin levels (LBXIN) using all variables in the dataset, which is treated as a regression problem.
+The second is the detection of insulin resistance, formulated as a binary classification problem.
+
+##Dataset Exploration
+```{r}
+colSums(is.na(my_data_clean))
+str(my_data_clean)
+my_data_clean$RIAGENDR <- as.factor(my_data_clean$RIAGENDR)
+my_data_clean$DIQ010   <- as.factor(my_data_clean$DIQ010)
+my_data_clean$PAQ605   <- as.factor(my_data_clean$PAQ605)
+my_data_clean$SEQN <- NULL
+```
+#Splitting the dataset into two subsets, training and testing:
+```{r}
+sample <- sample(c(TRUE, FALSE), nrow(my_data_clean), replace = TRUE, prob = c(0.7, 0.3))
+train  <- my_data_clean[sample, ]
+test   <- my_data_clean[!sample, ]
+```
+## part 1: Regression 
+#graphical representation
+```{r}
+variables <- setdiff(names(train), "LBXIN")
+n <- length(variables)
+rows <- ceiling(sqrt(n))
+cols <- ceiling(n / rows)
+par(mfrow = c(rows, cols), mar = c(4,4,2,1))
+for (var in variables) {
+  plot(train[[var]], train$LBXIN,
+       main = paste("LBXIN vs", var),
+       xlab = var,
+       ylab = "LBXIN",
+       pch = 16, col = "darkblue")
+}
+```
+Insulin (LBXIN) is positively associated with BMI (BMXBMI) and waist circumference (BMXWAIST), suggesting that excess abdominal fat promotes hyperinsulinemia through insulin resistance, further supported by the positive relationships with fasting glucose (LBXGLU) and the glucose tolerance test (LBXGLT). Conversely, HDL cholesterol (LBDHDD) shows a negative association with LBXIN, while blood pressure (BPXSY1, BPXDI1) exhibits only a weak relationship. Among categorical variables, diabetic status (DIQ010)  appears to be the most discriminating factor, whereas sex and age group show no meaningful differences.
+#Correlation analysis
+```{r}
+data_num <- train[sapply(train, is.numeric)]
+cor_data <- cor(data_num, use = "complete.obs")
+corrplot.mixed(cor_data,
+               lower = "circle",
+               upper = "number",
+               tl.col = "black",
+               tl.cex = 0.8)
+```
+The analysis shows a strong correlation between BMI (BMXBMI) and waist (BMXWAIST)
+#Variable Selection
+```{r}
+model1 <- lm(LBXIN ~ . - BMXWAIST, data = train)
+model2 <- lm(LBXIN ~ . - BMXBMI, data = train)
+summary(model1)
+summary(model2)
+```
+two models were compared — one excluding each variable. Model 2, retaining BMXWAIST, yielded a higher R² and is therefore selected.
+#Determine the factors that best minimize residuals using R².
+```{r}
+search.fact = regsubsets(LBXIN~age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU, nvmax = 15,
+                         method = "exhaustive", data = train)
+plot(search.fact, scale = "adjr2")
+```
+#Verify a posteriori that the regression conditions are satisfied:
+```{r}
+model <- lm(LBXIN ~ age_group + RIDAGEYR + RIAGENDR + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU, data = train)
+summary(model)
+check_model(model)
+```
+The model does not satisfy all linear regression assumptions. The residuals exhibit non-constant variance and deviate from normality. The linearity assumption is also partially violated, as the reference line shows a slight upward trend. These findings suggest that a log-transformation of LBXIN should be considered to improve model reliability.
+#data transformation:
+```{r}
+train$log_LBXIN <- log(train$LBXIN + 1)
+test$log_LBXIN <- log(test$LBXIN + 1)
+model_log <- lm(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU,
+                data = train)
+check_model(model_log)
+```
+#Estimate the importance of each factor selected in the model
+```{r}
+train_scaled <- train %>% mutate(across(where(is.numeric), scale))
+test_scaled <- test %>% mutate(across(where(is.numeric), scale))
+model_scaled <- lm(log_LBXIN ~ age_group + RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + 
+                  LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU,
+                data = train_scaled)
+summary(model_scaled)
+```
+Physical activity (PAQ605) is not significant in this model.
+#prediction
+```{r}
+model_final<-lm(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU,
+                data = train_scaled)
+pred_log <- predict(model_final, newdata = test_scaled)
+plot(test_scaled$log_LBXIN, pred_log,
+     xlab = "ins réel",
+     ylab = "ins prédit",
+     main = "ins réel vs prédit")
+abline(0,1,col="red")
+```
+The model generally follows the trend, with better accuracy in the range (-1:1). However, it tends to overestimate low values and underestimate high values. 
+The points furthest from the line correspond to atypical observations, explained by biological profiles not captured by the model or absent factors in the model.
+
+
+
+## Regression tree
+```{r}
+train$log_LBXIN <- NULL
+test$log_LBXIN  <- NULL
+
+max_tree = rpart(LBXIN ~ ., data = train, cp = 0)
+plotcp(max_tree) 
+cpOpt = max_tree$cptable[which.min(max_tree$cptable[,4]),1]
+```
+A maximal tree is built to explore all possible splits. The cp plot shows that the error  stabilizes at around 17 nodes. The optimal cp value, approximately 0.005, is selected at this point to prune the tree.
+```{r}
+pruned_tree = rpart(LBXIN ~ ., data = train, cp = cpOpt)
+rpart.plot(pruned_tree)
+plot(pruned_tree)
+
+```
+The pruned tree divides the population into 22 terminal nodes. Waist (BMXWAIST) is the root split, confirming its dominant role in predicting insulin levels. The majority of individuals (84%) have a BMXWAIST < 110 cm, with a mean insulin level of 9.7 µU/mL, and are further subdivided by BMI, age, fasting glucose, HDL and systolic blood pressure. For the remaining 16% (BMXWAIST ≥ 110 cm), insulin rises to 22 µU/mL, with the highest values observed in individuals combining a large waist, low HDL and high blood glucose.
+
+
+```{r}
+predictions <- predict(pruned_tree, newdata = test)
+plot(test$LBXIN, predictions,
+     xlab = "ins réel",
+     ylab = "ins prédit",
+     main = "Arbre de régression : ins réel vs prédit")
+abline(0, 1, col = "red")
+```
+The regression tree predicts low insulin values (0–20 µU/mL) well, with most points close to the diagonal. However, for high values, predictions are poor, the points deviate significantly from the red line. This is explained by the fact that a decision tree only predicts the mean of each leaf. 
+To address this limitation, a log-transformation of LBXIN will be applied to evaluate whether it improves prediction accuracy for extreme values
+
+```{r}
+x = sort(pruned_tree$variable.importance)
+df_importance = data.frame(Variable = factor(names(x), levels = names(x)), 	Importance = as.numeric(x))
+ggplot(df_importance, aes(x = Importance, y = Variable)) +
+  geom_col(fill = "skyblue") +
+  labs(x = "Variable importance", size = 0.1) +
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 6)) 
+```
+All variables contribute to the model, even those with a minimal score have a non-zero importance, meaning their presence has an effect on the prediction, however small.
+
+```{r}
+train$log_LBXIN <- log(train$LBXIN + 1)
+test$log_LBXIN  <- log(test$LBXIN + 1)
+max_tree <- rpart(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, data = train, cp = 0)
+plotcp(max_tree) 
+```
+After log-transformation, the error stabilizes at around 7–14 nodes with a minimum of ~0.60, lower than the 0.68 obtained without transformation, this confirm that the log-transformation improves predictive accuracy while producing a simpler tree.
+
+
+```{r}
+cpOpt <- max_tree$cptable[which.min(max_tree$cptable[,4]),1]
+pruned_tree <- rpart(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, data = train, cp = cpOpt)
+rpart.plot(pruned_tree)
+plot(pruned_tree)
+
+```
+After log-transformation, the pruned tree is more complex. BMXBMI replaces BMXWAIST as the root split, suggesting that BMI becomes the most discriminating predictor. More variables intervene at intermediate levels.
+```{r}
+predictions <- predict(pruned_tree, newdata = test)
+plot(test$log_LBXIN, predictions,
+     xlab = "ins réel (log)",
+     ylab = "ins prédit (log)",
+     main = "Arbre de régression : ins réel vs prédit")
+abline(0, 1, col = "red")
+```
+With log-transformation, the tree still struggles to follow the diagonal and the dispersion remains wide — confirming the structural limitation of decision trees which only predict the mean of each leaf. However, this prediction is better than without log-transformation, as confirmed by the lower cross-validated error.
+
+## Random forest
+```{r}
+train$log_LBXIN <- NULL
+test$log_LBXIN  <- NULL
+forest = randomForest(LBXIN ~ ., data = train)
+plot(forest)
+nb_vars = 1:5
+num_tree = 250
+
+Error_OOB_nbvars = c() 
+for (i in nb_vars){
+  print(paste("choice of", i, "variable(s) tested")) 
+  forest = randomForest(LBXIN ~., mtry = i, ntree = num_tree, 
+                        data =	train)
+  Error_OOB_nbvars[i] = forest$mse[num_tree]}
+plot(nb_vars, Error_OOB_nbvars)
+```
+The OOB error is minimal at mtry = 4, meaning that testing 4 variables at each split gives the best performance.
+
+```{r}
+forest = randomForest(LBXIN ~ ., data = train, 
+                      mtry = 4, ntree = 250)
+plot(forest)
+optimal_forest = randomForest(LBXIN ~ ., data = train, 
+                              mtry = 4, ntree = 1000)
+predictions <- predict(optimal_forest, newdata = test)
+plot(test$LBXIN, predictions,
+     xlab = "ins réel",
+     ylab = "ins prédit",
+     main = "Random Forest : ins réel vs prédit")
+abline(0,1,col="red")
+```
+The Random Forest follows the diagonal more closely than the single regression tree, particularly for low insulin values (0–20 µU/mL). However, it still underestimates high values, suggesting that extreme insulin profiles remain difficult to predict even with an ensemble method.
+A log-transformation of LBXIN will be applied in the next step
+
+```{r}
+train$log_LBXIN <- log(train$LBXIN + 1)
+test$log_LBXIN  <- log(test$LBXIN + 1)
+forest = randomForest(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, data = train)
+plot(forest)
+nb_vars = 1:5
+num_tree = 250
+
+Error_OOB_nbvars = c() 
+for (i in nb_vars){
+  print(paste("choice of", i, "variable(s) tested")) 
+  forest = randomForest(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, mtry = i, ntree = num_tree, 
+                        data =	train)
+  Error_OOB_nbvars[i] = forest$mse[num_tree]}
+plot(nb_vars, Error_OOB_nbvars)
+forest = randomForest(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, data = train, 
+                      mtry = 3, ntree = 1000)
+plot(forest) 
+optimal_forest = randomForest(log_LBXIN ~ age_group+ RIDAGEYR + RIAGENDR + PAQ605 + DIQ010 + LBXGLT + BMXWAIST + LBDHDD + BPXSY1 + BPXDI1 + LBXGLU + BMXBMI, data = train, 
+                              mtry = 3, ntree = 1000)
+predictions <- predict(optimal_forest, newdata = test)
+plot(test$log_LBXIN, predictions,
+     xlab = "ins réel (log)",
+     ylab = "ins prédit (log)",
+     main = "Random Forest : ins réel vs prédit")
+abline(0,1,col="red")
+```
+After log-transformation, the Random Forest shows a clear improvement — the points follow the diagonal much more closely across all value ranges, with a more uniform dispersion compared to the model without transformation. The prediction is more consistent for both low and high insulin values, confirming that the log-transformation significantly improves the Random Forest's predictive accuracy.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
